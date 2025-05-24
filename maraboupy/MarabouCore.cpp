@@ -45,6 +45,7 @@
 #include <fcntl.h>
 #include <map>
 #include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <set>
 #include <string>
@@ -520,6 +521,65 @@ calculateBounds( InputQuery &inputQuery, MarabouOptions &options, std::string re
     return std::make_tuple( resultString, ret, retStats );
 }
 
+std::tuple<bool, pybind11::array_t<double>, pybind11::array_t<double>>
+solve2( InputQuery &inputQuery, MarabouOptions &options, bool get_bounds )
+{
+    // Arguments: InputQuery object
+    // Returns: is_sat, lb, ub
+    //     constexpr size_t elsize = sizeof(double);
+    size_t shape[1]{inputQuery.getNumberOfVariables()};
+    size_t strides[1]{sizeof(double)};
+    auto lb = pybind11::array_t<double>(shape, strides);
+    auto ub = pybind11::array_t<double>(shape, strides);
+
+    auto lb_ptr = lb.mutable_unchecked<1>();
+    auto ub_ptr = ub.mutable_unchecked<1>();
+
+    bool is_sat = false;
+    try
+    {
+        options.setOptions();
+
+        Engine engine;
+
+        if ( !engine.calculateBounds( inputQuery ) )
+        {
+            is_sat = (engine.getExitCode() == Engine::SAT);
+            return std::make_tuple( is_sat, lb, ub );
+        }
+
+        if ( get_bounds )
+        {
+            engine.extractBounds( inputQuery );
+            for ( unsigned int i = 0; i < inputQuery.getNumberOfVariables(); ++i )
+            {
+                lb_ptr(i) = static_cast<double>(inputQuery.getLowerBound( i ));
+                ub_ptr(i) = static_cast<double>(inputQuery.getUpperBound( i ));
+            }
+        }
+
+        if ( !engine.processInputQuery( inputQuery ) ) {
+            is_sat = (engine.getExitCode() == Engine::SAT);
+            return std::make_tuple( is_sat, lb, ub );
+        }
+
+        unsigned timeoutInSeconds = Options::get()->getInt( Options::TIMEOUT );
+        engine.solve( timeoutInSeconds );
+
+        is_sat = (engine.getExitCode() == Engine::SAT);
+    }
+    catch ( const MarabouError &e )
+    {
+        fprintf( stderr,
+                 "Caught a MarabouError. Code: %u. Message: %s\n",
+                 e.getCode(),
+                 e.getUserMessage() );
+        abort();
+        // return std::make_tuple( "ERROR", ret, retStats );
+    }
+    return std::make_tuple( is_sat, lb, ub );
+}
+
 void saveQuery( InputQuery &inputQuery, std::string filename )
 {
     inputQuery.saveQuery( String( filename ) );
@@ -533,6 +593,150 @@ void saveQueryAsSmtLib( InputQuery &query, std::string filename )
 void loadQuery( std::string filename, InputQuery &inputQuery )
 {
     return QueryLoader::loadQuery( String( filename ), inputQuery );
+}
+
+struct Mat {
+    std::vector<double> data;
+    size_t rows;
+    size_t cols;
+};
+
+inline double access(Mat &mat, unsigned i, unsigned j) {
+    return mat.data[mat.cols * i + j];
+}
+
+void arrays_to_mats(const std::vector<py::array_t<double>>& arrays, std::vector<Mat>& mats)
+{
+    mats.clear();
+    for (auto& arr: arrays) {
+        auto buf = arr.unchecked<2>();
+        size_t rows = buf.shape(0);
+        size_t cols = buf.shape(1);
+        Mat mat;
+        mat.rows = rows;
+        mat.cols = cols;
+        mat.data.resize(rows * cols);
+        for (size_t i = 0; i < rows; ++i)
+            for (size_t j = 0; j < cols; ++j)
+                mat.data[i * cols + j] = buf(i, j);
+        mats.push_back(std::move(mat));
+    }
+}
+
+void arrays_to_vecs(const std::vector<py::array_t<double>>& arrays, std::vector<std::vector<double>>& vecs)
+{
+    vecs.clear();
+    for (auto& arr: arrays) {
+        auto buf = arr.unchecked<1>();
+        std::vector<double> vec;
+        vec.resize(buf.shape(0));
+        for (size_t i = 0; i < buf.shape(0); ++i)
+            vec[i] = buf(i);
+        vecs.push_back(std::move(vec));
+    }
+}
+
+class Equations{
+    public:
+        static void setCoef(unsigned n_layers, std::vector<pybind11::array_t<double>>& coefC, std::vector<pybind11::array_t<double>>& coefA, std::vector<pybind11::array_t<double>>& coefb)
+        {
+            arrays_to_mats(coefC, cC);
+            arrays_to_mats(coefA, cA);
+            arrays_to_vecs(coefb, cb);
+        }
+
+        Equations(unsigned n, Equation::EquationType type) {
+            eqs.reserve(n);
+            for (unsigned i = 0; i < n; ++i)
+                eqs.emplace_back(type);
+        }
+
+        /* void setScalars( pybind11::array_t<double>& coef )
+        {
+            auto arr = coef.unchecked<1>();
+
+            for (size_t i = 0; i < eqs.size(); ++i)
+                eqs[i].setScalar(arr(i));
+        } */
+
+        void setScalar_negb(unsigned l)
+        {
+            for (size_t i = 0; i < eqs.size(); ++i)
+                eqs[i].setScalar(-cb[l][i]);
+        }
+
+        void addAddends( unsigned idx, double coef)
+        {
+            for (size_t i = 0; i < eqs.size(); ++i)
+                eqs[i].addAddend(coef, idx + i);
+        }
+
+        /* void addAddends2( unsigned idx, pybind11::array_t<double>& coef )
+        {
+            auto arr = coef.unchecked<2>();
+
+            for (size_t i = 0; i < eqs.size(); ++i)
+                for (ssize_t j = 0; j < arr.shape(1); ++j)
+                    eqs[i].addAddend(arr(i, j), idx + j);
+        } */
+
+        void addAddend_C( unsigned idx, unsigned l)
+        {
+            for (size_t i = 0; i < eqs.size(); ++i)
+                for (ssize_t j = 0; j < cC[l].cols; ++j)
+                    eqs[i].addAddend(access(cC[l], i, j), idx + j);
+        }
+
+        void addAddend_A( unsigned idx, unsigned l)
+        {
+            for (size_t i = 0; i < eqs.size(); ++i)
+                for (ssize_t j = 0; j < cA[l].cols; ++j)
+                    eqs[i].addAddend(access(cA[l], i, j), idx + j);
+        }
+
+        void addTo( InputQuery &ipq)
+        {
+            for (Equation& eq : eqs)
+                ipq.addEquation(eq);
+        }
+
+    private:
+        std::vector<Equation> eqs;
+
+        static std::vector<Mat> cC;
+        static std::vector<Mat> cA;
+        static std::vector<std::vector<double>> cb;
+};
+
+std::vector<Mat> Equations::cC;
+std::vector<Mat> Equations::cA;
+std::vector<std::vector<double>> Equations::cb;
+
+void tightenBounds( InputQuery &ipq, unsigned idx, pybind11::array_t<double>& lb, pybind11::array_t<double>& ub )
+{
+    auto arr_lb = lb.unchecked<1>();
+    auto arr_ub = ub.unchecked<1>();
+
+    for (pybind11::ssize_t i = 0; i < arr_lb.shape(0); ++i) {
+        ipq.tightenLowerBound(idx + i, arr_lb(i));
+        ipq.tightenUpperBound(idx + i, arr_ub(i));
+    }
+}
+
+void markInputVariables( InputQuery &ipq, unsigned idx, unsigned input, unsigned n)
+{
+    for (pybind11::ssize_t i = 0; i < n; ++i) {
+        ipq.markInputVariable(idx + i, input);
+        ++input;
+    }
+}
+
+void addReluConstraints( InputQuery &ipq, unsigned idx1, unsigned idx2, unsigned n )
+{
+    for (pybind11::ssize_t i = 0; i < n; ++i) {
+        PiecewiseLinearConstraint *r = new ReluConstraint( idx1 + i, idx2 + i );
+        ipq.addPiecewiseLinearConstraint( r );
+    }
 }
 
 // Code necessary to generate Python library
@@ -591,6 +795,13 @@ PYBIND11_MODULE( MarabouCore, m )
            py::arg( "inputQuery" ),
            py::arg( "options" ),
            py::arg( "redirect" ) = "" );
+    m.def( "solve2",
+           &solve2,
+           R"pbdoc(
+        )pbdoc",
+           py::arg( "inputQuery" ),
+           py::arg( "options" ),
+           py::arg( "get_bounds" ));
     m.def( "calculateBounds",
            &calculateBounds,
            R"pbdoc(
@@ -790,6 +1001,33 @@ PYBIND11_MODULE( MarabouCore, m )
         )pbdoc",
            py::arg( "inputQuery" ),
            py::arg( "disjuncts" ) );
+    m.def( "tightenBounds",
+           &tightenBounds,
+           R"pbdoc(
+        XXX
+        )pbdoc",
+           py::arg( "ipq" ),
+           py::arg( "idx" ),
+           py::arg( "lb" ),
+           py::arg( "ub" ) );
+    m.def( "markInputVariables",
+           &markInputVariables,
+           R"pbdoc(
+        XXX
+        )pbdoc",
+           py::arg( "inputQuery" ),
+           py::arg( "idx" ),
+           py::arg( "input" ),
+           py::arg( "n" ) );
+    m.def( "addReluConstraints",
+           &addReluConstraints,
+           R"pbdoc(
+        XXX
+        )pbdoc",
+           py::arg( "ipq" ),
+           py::arg( "idx1" ),
+           py::arg( "idx2" ),
+           py::arg( "n" ) );
     py::class_<InputQuery>( m, "InputQuery" )
         .def( py::init() )
         .def( "setUpperBound", &InputQuery::setUpperBound )
@@ -829,6 +1067,14 @@ PYBIND11_MODULE( MarabouCore, m )
     eq.def( py::init<Equation::EquationType>() );
     eq.def( "addAddend", &Equation::addAddend );
     eq.def( "setScalar", &Equation::setScalar );
+    py::class_<Equations> eqs( m, "Equations" );
+    eqs.def( py::init<unsigned, Equation::EquationType>() );
+    eqs.def_static( "setCoef", &Equations::setCoef );
+    eqs.def( "setScalar_negb", &Equations::setScalar_negb );
+    eqs.def( "addAddends", &Equations::addAddends );
+    eqs.def( "addAddend_C", &Equations::addAddend_C );
+    eqs.def( "addAddend_A", &Equations::addAddend_A );
+    eqs.def( "addTo", &Equations::addTo );
     py::enum_<Statistics::StatisticsUnsignedAttribute>( m, "StatisticsUnsignedAttribute" )
         .value( "NUM_POPS", Statistics::StatisticsUnsignedAttribute::NUM_POPS )
         .value( "CURRENT_DECISION_LEVEL",
